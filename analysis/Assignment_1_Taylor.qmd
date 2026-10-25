@@ -445,11 +445,11 @@ fent_analogs <- c(
 )
 
 fent_analog_tbl <- tibble(
-  term = fent_analogs
+  Term = fent_analogs
 ) |> 
-  mutate(docs = map_dbl(term, 
+  mutate(Tweets = map_dbl(Term, 
                         \(x) col_sums(doc_term_mx_bin[, x]))) |> 
-  arrange(desc(docs))
+  arrange(desc(Tweets))
 
 fent_analog_tbl |> 
   kbl(caption = "Tweets by Fentanyl Analog",
@@ -486,7 +486,7 @@ dtm_vec_col <- dtm_vec_meth * 0
 # Calculate correlation between key terms and each candidate term
 for(term_num in 1:length(candidate_nums)){
   
-  dtm_vec_col[] <- as.vector(doc_term_mx[, term_num])
+  dtm_vec_col[] <- as.vector(doc_term_mx[, candidate_nums[term_num]])
   
   cor_vec_meth[term_num] <- cor(dtm_vec_meth, dtm_vec_col)
   cor_vec_subox[term_num] <- cor(dtm_vec_subox, dtm_vec_col)
@@ -595,6 +595,44 @@ term_counts <- tibble(
 term_counts
 ```
 
+```{r}
+#| label: freq figures
+
+# Reshape data to plot
+term_counts_toplot <- term_counts |> 
+  pivot_longer(-keyword,
+               names_pattern = "([a-zA-Z_]+)_([0-9])",
+               names_to = c(".value", "set_num")) |> 
+  pivot_longer(-c(keyword, set_num)) |> 
+  mutate(set_cln = case_when(set_num == 1 ~ "Pre-COVID",
+                             set_num == 2 ~ "During COVID"),
+         name_cln = recode_values(name,
+                                  "terms" ~ "Appearances",
+                                  "docs" ~ "Tweets",
+                                  "terms_per_doc" ~ "Appearances per Tweet",
+                                  "pct_docs" ~ "Pct. of Tweets")) |> 
+  mutate(set_cln = factor(set_cln, levels = c("Pre-COVID", "During COVID")))
+
+pd <- position_dodge(width = 0.9)
+
+# Plot term counts
+term_counts_plot <- ggplot(term_counts_toplot |> 
+                             filter(name %in% c("terms_per_doc")),
+                           aes(x = set_cln, y = value, 
+                               fill = keyword, group = keyword)) +
+  geom_col(position = pd) +
+  geom_point(position = pd, shape = 21) +
+  geom_line(position = pd) +
+  labs(x = "Set",
+       y = "Appearances per Tweet",
+       fill = "Keyword") +
+  theme(legend.position = "bottom")
+
+ggsave(here("results", "term_counts_plot.png"),
+       term_counts_plot,
+       height = 6.5, width = 6.5, units = "in")
+```
+
 
 # 8: Bigrams
 
@@ -621,12 +659,6 @@ text_corpus_bi <- tweet_text_corpus[which(words_per_text >= 2)]
 # Correct indices for 2 sets in this corpus
 inds_bi_1 <- 1:(nrow(s1e) - num_too_short_1)
 inds_bi_2 <- (max(inds_bi_1) + 1):length(text_corpus_bi)
-
-# temp_list <- vector(mode = "list", length = length(text_corpus_bi))
-# for(t_i in 1:length(text_corpus_bi)){
-#   temp_list[[t_i]] <- ngramrr(text_corpus_bi$content[[t_i]]$content,
-#                               ngmin = 2, ngmax = 2)
-# }
 
 # Make document term matrix
 dtm_bi <- dtm2(
@@ -663,5 +695,37 @@ top10_bis <- tibble(
          count_per_doc_total = total / length(text_corpus_bi)) |> 
   arrange(desc(total))
 
+```
+
+```{r}
+#| label: bigrams plot
+
+# Reshape data to plot
+bigrams_toplot <- top10_bis |> 
+  arrange(desc(count_per_doc_1)) |> 
+  mutate(Term = fct_inorder(Term)) |> 
+  pivot_longer(-c(Term, total, count_per_doc_total),
+               names_pattern = "([a-zA-Z_]+)_([0-9])",
+               names_to = c(".value", "set_num")) |> 
+  mutate(set_cln = case_when(set_num == 1 ~ "Pre-COVID",
+                             set_num == 2 ~ "During COVID")) |> 
+  mutate(set_cln = factor(set_cln, levels = c("Pre-COVID", "During COVID")))
+
+# Plot term counts
+bigrams_plot <- ggplot(bigrams_toplot,
+                       aes(x = Term, y = count_per_doc, 
+                           fill = Term)) +
+  geom_col() +
+  facet_wrap(~set_cln, nrow = 1) +
+  scale_fill_discrete(palette = "Set3",
+                      guide = "none") +
+  labs(x = "Keyword",
+       y = "Appearances per Tweet",
+       fill = "Keyword") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here("results", "bigrams_plot.png"),
+       bigrams_plot,
+       height = 6.5, width = 6.5, units = "in")
 ```
 
