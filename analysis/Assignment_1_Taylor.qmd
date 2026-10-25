@@ -1,0 +1,667 @@
+---
+title: "BSHES 740 Assignment 1"
+author: "Ryan Taylor"
+format: 
+  pdf:
+    number-depth: 4
+    mainfont: Times New Roman
+    include-in-header:
+      - text: |
+          \usepackage{makecell}
+          \usepackage{longtable}
+          \usepackage{mathrsfs}
+          \usepackage{fvextra}
+          \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+    include-before-body:
+      - text: |
+          \RecustomVerbatimEnvironment{verbatim}{Verbatim}{
+          showspaces = false,
+          showtabs = false,
+          breaksymbolleft={},
+          breaklines}
+    df-print: kable
+    knitr:
+      opts_chunk:
+        echo: true,
+        include: true
+        message: false
+        warning: false
+        results: markup
+        fig.align: center
+        fig.height: 5
+        fig.width: 7
+        fig.path: "../results/"
+        R.options:
+          scipen: 999
+          knitr.kable.NA: ""
+editor: source
+---
+
+```{r}
+#| label: setup
+
+rm(list = ls()); gc()
+
+pacman::p_load(
+  tm, wordcloud, jsonlite, SnowballC, slam, ngramrr,
+  tidyverse, here, janitor,
+  gt, knitr, kableExtra
+)
+```
+
+# 0: Load files
+
+First, we load the two csv files.
+
+```{r}
+#| label: load tweets
+
+s1 <- read_csv(here("data", "TADA_A1_set1.csv"))
+
+s2 <- read_csv(here("data", "TADA_A1_set2.csv"))
+```
+# 1: Date ranges, information, and languages
+
+```{r}
+#| label: date ranges
+
+# Get minimum and maximum date for each dataset
+date_range_1 <- range(s1$date)
+date_range_2 <- range(s2$date)
+
+cat("Set 1 dates:", 
+    format(date_range_1[1], "%b %d, %Y"), 
+    "to", 
+    format(date_range_1[2], "%b %d, %Y"),
+    "\n")
+
+cat("Set 2 dates:", 
+    format(date_range_2[1], "%b %d, %Y"), 
+    "to", 
+    format(date_range_2[2], "%b %d, %Y"))
+```
+
+```{r}
+#| label: information
+
+# Check that the two data sets have the same info
+all.equal(names(s1), names(s2))
+
+# List names of first set
+names(s1)
+
+cat("Set 1 Tweets:", nrow(s1), "\n")
+cat("Set 2 Tweets:", nrow(s2), "\n")
+
+cat("Set 1 Unique IDs:", length(unique(s1$id)), "\n")
+cat("Set 2 Unique IDs:", length(unique(s2$id)), "\n")
+
+cat("Set 1 Unique Locations:", length(unique(s1$location)), "\n")
+cat("Set 2 Unique Locations:", length(unique(s2$location)), "\n")
+```
+
+```{r}
+#| label: language dictionary
+
+# Input dictionary of language codes from Twitter developer Igor Brigadir
+# https://github.com/igorbrigadir/twitter-advanced-search/issues/24
+
+lang_dict_txt <- "
+Amharic: am 
+Arabic: ar 
+Armenian: hy 
+Basque: eu 
+Bengali: bn 
+Bosnian: bs 
+Bulgarian: bg 
+Burmese: my 
+Catalan: ca 
+Croatian: hr 
+Czech: cs 
+Danish: da 
+Dutch: nl 
+English: en 
+Estonian: et 
+Finnish: fi 
+French: fr 
+Georgian: ka 
+German: de 
+Greek: el 
+Gujarati: gu 
+Haitian Creole: ht 
+Hebrew: iw 
+Hindi: hi 
+Hungarian: hu 
+Icelandic: is 
+Indonesian: in 
+Italian: it 
+Japanese: ja 
+Kannada: kn 
+Khmer: km 
+Korean: ko 
+Lao: lo 
+Latinized Hindi: hi-Latn 
+Latvian: lv 
+Lithuanian: lt 
+Malayalam: ml 
+Maldivian: dv 
+Marathi: mr 
+Nepali: ne 
+Norwegian: no 
+Oriya: or 
+Panjabi: pa 
+Pashto: ps 
+Persian: fa 
+Polish: pl 
+Portuguese: pt 
+Romanian: ro 
+Russian: ru 
+Serbian: sr 
+Simplified Chinese: zh-CN 
+Sindhi: sd 
+Sinhala: si 
+Slovak: sk
+Slovenian: sl
+Sorani Kurdish: ckb
+Spanish: es
+Swedish: sv
+Tagalog: tl
+Tamil: ta
+Telugu: te
+Thai: th
+Tibetan: bo
+Traditional Chinese: zh-TW
+Turkish: tr
+Ukrainian: uk
+Urdu: ur
+Uyghur: ug
+Vietnamese: vi
+Welsh: cy
+"
+
+# Conver this to a table
+lang_dict <- tibble(txt = read_lines(I(lang_dict_txt), skip_empty_rows = T)) |> 
+  mutate(txt = str_trim(txt)) |> 
+  separate_wider_delim(txt, ": ", names = c("language", "lang"))
+```
+
+```{r}
+#| label: language count
+
+# Merge clean languages with both sets
+s1 <- s1 |> left_join(lang_dict)
+s2 <- s2 |> left_join(lang_dict)
+
+# Tally languages
+s1_langs <- tabyl(s1, language) |> 
+  arrange(desc(n))
+
+s2_langs <- tabyl(s2, language) |> 
+  arrange(desc(n))
+
+s1_langs |> 
+  mutate(across(matches("percent"), \(x) scales::label_percent(accuracy = 0.01)(x))) |> 
+  kbl(caption = "Languages in Set 1",
+      booktabs = T,
+      format.args = list(big.mark = ",")) |> 
+  kable_styling(full_width = F)
+
+s2_langs |> 
+  mutate(across(matches("percent"), \(x) scales::label_percent(accuracy = 0.01)(x))) |> 
+  kbl(caption = "Languages in Set 2",
+      booktabs = T) |> 
+  kable_styling(full_width = F)
+```
+
+# 2: Count total posts
+
+Before counting total posts, we choose to filter out languages other than English. In many languages, "fent" is a common verb, and it will also be easiest to determine context and associations and understand n-grams in English.
+
+```{r}
+#| label: filter to english
+
+s1e <- s1 |> filter(language == "English")
+
+s2e <- s2 |> filter(language == "English")
+
+cat("Set 1 English Tweets:", nrow(s1e), "\n")
+cat("Set 2 English Tweets:", nrow(s2e), "\n")
+
+se <- bind_rows(s1e |> mutate(set = 1), 
+                s2e |> mutate(set = 2))
+
+inds_1 <- 1:nrow(s1e)
+
+inds_2 <- (nrow(s1e) + 1):nrow(se)
+```
+
+# 3: Tweets by keyword
+
+Before searching for specific keywords, we create a corpus and preprocess the tweets.
+
+```{r}
+#| label: corpus
+
+# Identify text
+tweet_text <- se$text |> 
+  str_replace_all("\\s+", " ")
+
+# Create corpus
+tweet_text_corpus <- VCorpus(VectorSource(tweet_text))
+
+# Collapse white space
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(stripWhitespace))
+
+# Lowercase
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(tolower))
+
+# Remove underscores
+removeUnderscores <- function(x){
+  str_replace_all(x, "_", "")
+  }
+
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(removeUnderscores))
+
+# Replace any other punctuation and symbols with a space
+
+replacePunctSym <- function(x){
+  str_replace_all(x, "[\\p{P}|\\p{S}]", " ")
+  }
+
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(replacePunctSym))
+
+replaceHighUTFs <- function(x){
+  str_replace_all(x, "[^\\x01-\\xE1BFBE]", " ")
+  }
+
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(replaceHighUTFs))
+
+# Remove numbers (including superscripts and subscripts)
+removeAllNumbers <- function(x){
+  str_remove_all(x, "[\\p{N}]")
+}
+
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(removeAllNumbers))
+
+# Remove URLs
+removeURLs <- function(x) gsub("http(s)?(\\s)?[[:alnum:]]+", "", x)
+
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(removeURLs))
+
+# Remove stop words
+my_stops <- c(replacePunctSym(stopwords()),  
+              "can", "yes", "yeah", "via", "t", "co")
+
+tweet_text_corpus <- tm_map(
+  tweet_text_corpus, 
+  content_transformer(removeWords),
+  words = my_stops
+)
+
+# Stem words
+tweet_text_corpus <- tm_map(
+  tweet_text_corpus, 
+  content_transformer(stemDocument)
+)
+
+# Remove stopwords from stemmed words
+tweet_text_corpus <- tm_map(
+  tweet_text_corpus, 
+  content_transformer(removeWords),
+  words = my_stops
+)
+
+# Collapse white space again
+tweet_text_corpus <- tm_map(tweet_text_corpus, 
+                            content_transformer(stripWhitespace))
+
+# Make document term matrix
+doc_term_mx <- DocumentTermMatrix(tweet_text_corpus,
+                                  control = list(tokenize = "Boost"))
+
+doc_term_mx_bin <- DocumentTermMatrix(tweet_text_corpus,
+                                      control = list(tokenize = "Boost",
+                                                     weighting = weightBin))
+```
+
+By looking at the words tokenized in this document term matrix, we find many potential analogs of fentanyl. We look at all words that include "fent" and identify specific instances that we can exclude, like names and other brand names.
+
+```{r}
+#| label: fent keyword clarification
+
+dimnames(doc_term_mx)[[2]][which(str_detect(dimnames(doc_term_mx)[[2]], "fent"))]
+
+# Identify options to exclude for fentanyl
+fent_exc <- c("fentiman", "fentimansltd",
+              "fentmaryvonn",
+              "fentybeauti", "fentyeffect", "fentyoffici",
+              "gracefentiman", 
+              "jackfentonnn", "lalisaxfenti", "rakimfenti",
+              "savagexfenti")
+
+fent_cols <- which(
+  str_detect(dimnames(doc_term_mx)[[2]], "fent") &
+    !(dimnames(doc_term_mx)[[2]] %in% fent_exc)
+)
+
+```
+
+```{r}
+#| label: methadone keyword clarification
+
+dimnames(doc_term_mx)[[2]][which(str_detect(dimnames(doc_term_mx)[[2]], "metha"))]
+
+# Identify options to include for methadone
+# https://www.drugs.com/cons/methadose.html#brand-names
+meth_cols <- which(
+  str_detect(dimnames(doc_term_mx)[[2]], 
+             "methado|methason|doloph|disket")
+)
+```
+
+```{r}
+#| label: suboxone keyword clarification
+
+dimnames(doc_term_mx)[[2]][which(str_detect(dimnames(doc_term_mx)[[2]], "subox"))]
+
+# Identify options to include for suboxone
+subox_cols <- which(
+  str_detect(dimnames(doc_term_mx)[[2]], 
+             "subox")
+)
+```
+
+```{r}
+#| label: keyword counts
+
+keyword_counts <- tibble(
+  keyword = c("methadone", "suboxone", "fentanyl"),
+  count_term = c(
+    col_sums(doc_term_mx_bin[, "methadon"]),
+    col_sums(doc_term_mx_bin[, "suboxon"]),
+    col_sums(doc_term_mx_bin[, "fentanyl"])
+  ),
+  count_all = c(
+    sum(col_sums(doc_term_mx_bin[, meth_cols])),
+    sum(col_sums(doc_term_mx_bin[, subox_cols])),
+    sum(col_sums(doc_term_mx_bin[, fent_cols]))
+  )
+) |> 
+  mutate(pct_term = scales::label_percent(accuracy = 0.01)(count_term / count_all))
+
+kbl(keyword_counts,
+    caption = "Tweets by Keyword",
+    booktabs = T,
+    format.args = list(big.mark = ",")) |> 
+  kable_styling(full_width = F)
+```
+
+# 4: Fentanyl analogs
+
+Based on the word tokens we identified above matching the string "fent" string, we see the fentanyl analogs:
+  - acetylfentanyl
+  - acrylfentanyl
+  - alfentanil
+  - benzylfentanyl
+  - butyrfentanyl
+  - carfentanil
+  - crotonylfentanyl
+  - cyclopropylfentanyl
+  - despropionylfentanyl
+  - isobutyrylfentanyl
+  - methoxyacetylyfentanyl
+  - methylfentanyl
+  - remifentanil
+  - sufentanil
+  - valerylfentanyl
+
+```{r}
+#| label: analog counts
+
+fent_analogs <- c(
+  "fentanyl",
+  "acetylfentanyl",
+  "acrylfentanyl",
+  "alfentanil",
+  "benzylfentanyl",
+  "butyrfentanyl",
+  "carfentanil",
+  "crotonylfentanyl",
+  "cyclopropylfentanyl",
+  "despropionylfentanyl",
+  "isobutyrylfentanyl",
+  "methoxyacetylfentanyl",
+  "methylfentanyl",
+  "remifentanil",
+  "sufentanil",
+  "valerylfentanyl"
+)
+
+fent_analog_tbl <- tibble(
+  term = fent_analogs
+) |> 
+  mutate(docs = map_dbl(term, 
+                        \(x) col_sums(doc_term_mx_bin[, x]))) |> 
+  arrange(desc(docs))
+
+fent_analog_tbl |> 
+  kbl(caption = "Tweets by Fentanyl Analog",
+    booktabs = T,
+    format.args = list(big.mark = ",")) |> 
+  kable_styling(full_width = F)
+```
+
+# 5: Associated Topics
+
+Since each term's correct spelling makes up the vast majority of its appearances, for simplicity we find associations with each term alone. We do not incorporate all of the alternative spellings and associated terms. 
+
+```{r}
+#| label: associated topics
+
+# Get vector for each term we are interested in
+dtm_vec_meth <- as.vector(doc_term_mx[, "methadon"])
+dtm_vec_subox <- as.vector(doc_term_mx[, "suboxon"])
+dtm_vec_fent <- as.vector(doc_term_mx[, "fentanyl"])
+
+# Count instances of every word in matrix
+word_counts <- col_sums(doc_term_mx)
+
+# Set threshold to keep as 10% of lowest key term frequency
+word_thresh <- 0.1 * min(keyword_counts$count_term)
+
+# Filter terms to pass this threshold
+candidate_nums <- which(word_counts >= word_thresh)
+
+# Pre-allocate correlation vectors
+cor_vec_meth <- cor_vec_subox <- cor_vec_fent <- rep(0, length(candidate_nums))
+dtm_vec_col <- dtm_vec_meth * 0
+
+# Calculate correlation between key terms and each candidate term
+for(term_num in 1:length(candidate_nums)){
+  
+  dtm_vec_col[] <- as.vector(doc_term_mx[, term_num])
+  
+  cor_vec_meth[term_num] <- cor(dtm_vec_meth, dtm_vec_col)
+  cor_vec_subox[term_num] <- cor(dtm_vec_subox, dtm_vec_col)
+  cor_vec_fent[term_num] <- cor(dtm_vec_fent, dtm_vec_col)
+}
+
+# Match these correlations to corresponding words
+cor_tbl_meth <- tibble(
+  cand_index = which(-cor_vec_meth %in% head(sort(-cor_vec_meth), 10))
+) |> 
+  mutate(corr = map_dbl(cand_index, \(x) cor_vec_meth[x])) |> 
+  mutate(mx_index = map_dbl(cand_index, \(x) candidate_nums[x])) |> 
+  mutate(term = map_chr(mx_index, \(x) dimnames(doc_term_mx)[[2]][x])) |> 
+  arrange(desc(corr))
+
+cor_tbl_subox <- tibble(
+  cand_index = which(-cor_vec_subox %in% head(sort(-cor_vec_subox), 10))
+) |> 
+  mutate(corr = map_dbl(cand_index, \(x) cor_vec_subox[x])) |> 
+  mutate(mx_index = map_dbl(cand_index, \(x) candidate_nums[x])) |> 
+  mutate(term = map_chr(mx_index, \(x) dimnames(doc_term_mx)[[2]][x])) |> 
+  arrange(desc(corr))
+
+cor_tbl_fent <- tibble(
+  cand_index = which(-cor_vec_fent %in% head(sort(-cor_vec_fent), 10))
+) |> 
+  mutate(corr = map_dbl(cand_index, \(x) cor_vec_fent[x])) |> 
+  mutate(mx_index = map_dbl(cand_index, \(x) candidate_nums[x])) |> 
+  mutate(term = map_chr(mx_index, \(x) dimnames(doc_term_mx)[[2]][x])) |> 
+  arrange(desc(corr))
+```
+
+# 6: Word Clouds
+
+```{r}
+#| label: word clouds
+
+wordcloud(tweet_text_corpus[inds_1], 
+          min.freq=10, 
+          max.words=200, 
+          scale=c(1.5,.1), 
+          random.order=FALSE, 
+          colors=brewer.pal(9, "Set1"))
+
+wordcloud(tweet_text_corpus[inds_2], 
+          min.freq=10, 
+          max.words=200, 
+          scale=c(1.5,.1), 
+          random.order=FALSE, 
+          colors=brewer.pal(9, "Set1"))
+
+# Save to files
+png(here("results", "cloud1.png"), width = 800, height = 800, res = 400)
+wordcloud(tweet_text_corpus[inds_1], 
+                min.freq=10, 
+                max.words=200, 
+                scale=c(1.5,.1), 
+                random.order=FALSE, 
+                colors=brewer.pal(9, "Set1"))
+dev.off()
+
+png(here("results", "cloud2.png"), width = 800, height = 800, res = 400)
+wordcloud(tweet_text_corpus[inds_2], 
+                min.freq=10, 
+                max.words=200, 
+                scale=c(1.5,.1), 
+                random.order=FALSE, 
+                colors=brewer.pal(9, "Set1"))
+dev.off()
+
+```
+
+# 7: Frequency figures
+
+```{r}
+#| label: frequency counts
+
+term_counts <- tibble(
+  keyword = c("methadone", "suboxone", "fentanyl"),
+  terms_1 = c(
+    col_sums(doc_term_mx[inds_1, "methadon"]),
+    col_sums(doc_term_mx[inds_1, "suboxon"]),
+    col_sums(doc_term_mx[inds_1, "fentanyl"])
+  ),
+  docs_1 = c(
+    col_sums(doc_term_mx_bin[inds_1, "methadon"]),
+    col_sums(doc_term_mx_bin[inds_1, "suboxon"]),
+    col_sums(doc_term_mx_bin[inds_1, "fentanyl"])
+  ),
+  terms_2 = c(
+    col_sums(doc_term_mx[inds_2, "methadon"]),
+    col_sums(doc_term_mx[inds_2, "suboxon"]),
+    col_sums(doc_term_mx[inds_2, "fentanyl"])
+  ),
+  docs_2 = c(
+    col_sums(doc_term_mx_bin[inds_2, "methadon"]),
+    col_sums(doc_term_mx_bin[inds_2, "suboxon"]),
+    col_sums(doc_term_mx_bin[inds_2, "fentanyl"])
+  )
+) |> 
+  mutate(terms_per_doc_1 = terms_1 / length(inds_1),
+         pct_docs_1 = docs_1 / length(inds_1),
+         terms_per_doc_2 = terms_2 / length(inds_2),
+         pct_docs_2 = docs_2 / length(inds_2))
+
+term_counts
+```
+
+
+# 8: Bigrams
+
+```{r}
+#| label: create bigrams
+
+# Find single-word tweets
+words_per_text <- map_dbl(
+  tweet_text_corpus$content,
+  function(x){
+    length(unlist(strsplit(x$content, split = " ")))
+  }
+)
+
+# Identify which tweets need to be removed for bigrams
+inds_too_short <- which(words_per_text < 2)
+
+# Count which tweets need to be removed in each set
+num_too_short_1 <- sum(inds_too_short <= nrow(s1e))
+
+# Create new corpus for bigrams
+text_corpus_bi <- tweet_text_corpus[which(words_per_text >= 2)]
+
+# Correct indices for 2 sets in this corpus
+inds_bi_1 <- 1:(nrow(s1e) - num_too_short_1)
+inds_bi_2 <- (max(inds_bi_1) + 1):length(text_corpus_bi)
+
+# temp_list <- vector(mode = "list", length = length(text_corpus_bi))
+# for(t_i in 1:length(text_corpus_bi)){
+#   temp_list[[t_i]] <- ngramrr(text_corpus_bi$content[[t_i]]$content,
+#                               ngmin = 2, ngmax = 2)
+# }
+
+# Make document term matrix
+dtm_bi <- dtm2(
+  text_corpus_bi,
+  ngmin = 2, ngmax = 2
+)
+```
+
+```{r}
+#| label: count most frequent terms
+
+bigram_freqs_1 <- col_sums(dtm_bi[inds_bi_1,])
+
+bigram_freqs_2 <- col_sums(dtm_bi[inds_bi_2,])
+
+top10_1 <- sort(bigram_freqs_1, decreasing = T)[1:10]
+
+top10_2 <- sort(bigram_freqs_2, decreasing = T)[1:10]
+  
+tbl10_1 <- enframe(top10_1, name = "Term", value = "Frequency")
+
+tbl10_2 <- enframe(top10_2, name = "Term", value = "Frequency")
+
+top10_bis <- tibble(
+  "Term" = unique(c(tbl10_1$Term, tbl10_2$Term))
+) |> 
+  mutate(
+    count_1 = map_dbl(Term, \(x) col_sums(dtm_bi[inds_bi_1, x])),
+    count_2 = map_dbl(Term, \(x) col_sums(dtm_bi[inds_bi_2, x]))
+  ) |> 
+  mutate(total = count_1 + count_2) |> 
+  mutate(count_per_doc_1 = count_1 / length(inds_bi_1),
+         count_per_doc_2 = count_2 / length(inds_bi_2),
+         count_per_doc_total = total / length(text_corpus_bi)) |> 
+  arrange(desc(total))
+
+```
+
